@@ -1,1 +1,12 @@
-streamlit
+streamlit==1.25.0
+polars==0.18.10
+duckdb==0.8.1
+numpy>=1.23.5
+pandas>=1.5.3
+pyarrow>=11.0.0
+openpyxl>=3.1.2
+python-dateutil>=2.8.2
+six>=1.16.0
+typing_extensions>=4.5.0
+pathlib2>=2.3.6
+pillow==9.4.0
