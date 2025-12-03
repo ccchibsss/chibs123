@@ -213,15 +213,11 @@ class HighVolumeAutoPartsCatalog:
             return
         
         df = df.unique(keep='first')
-        
         cols = df.columns
         pk_str = ", ".join(f'"{c}"' for c in pk)
-        
         temp_view_name = f"temp_{table_name}_{int(time.time())}"
         self.conn.register(temp_view_name, df.to_arrow())
-        
         update_cols = [col for col in cols if col not in pk]
-        
         if not update_cols:
             on_conflict_action = "DO NOTHING"
         else:
@@ -233,7 +229,6 @@ class HighVolumeAutoPartsCatalog:
         SELECT * FROM {temp_view_name}
         ON CONFLICT ({pk_str}) {on_conflict_action};
         """
-        
         try:
             self.conn.execute(sql)
             logger.info(f"Успешно обновлено/вставлено {len(df)} записей в таблицу {table_name}.")
@@ -245,7 +240,6 @@ class HighVolumeAutoPartsCatalog:
 
     def process_and_load_data(self, dataframes: Dict[str, pl.DataFrame]):
         st.info("🔄 Начало загрузки и обновления данных в базе...")
-        
         steps = [s for s in ['oe', 'cross', 'parts', 'prices'] if s in dataframes or s == 'parts']
         num_steps = len(steps)
         progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
@@ -255,14 +249,13 @@ class HighVolumeAutoPartsCatalog:
             step_counter += 1
             progress_bar.progress(step_counter / (num_steps + 1), text=f"({step_counter}/{num_steps}) Обработка OE данных...")
             df = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
-            
             oe_df = df.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'], keep='first')
             if 'name' in oe_df.columns:
                 oe_df = oe_df.with_columns(self.determine_category_vectorized(pl.col('name')))
             else:
                 oe_df = oe_df.with_columns(category=pl.lit('Разное'))
             self.upsert_data('oe_data', oe_df, ['oe_number_norm'])
-            
+
             cross_df_from_oe = df.filter(pl.col('artikul_norm') != "").select(['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
             self.upsert_data('cross_references', cross_df_from_oe, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
@@ -276,59 +269,46 @@ class HighVolumeAutoPartsCatalog:
         step_counter += 1
         progress_bar.progress(step_counter / (num_steps + 1), text=f"({step_counter}/{num_steps}) Сборка и обновление данных по артикулам...")
         parts_df = None
-        # Определяем порядок обработки файлов для правильного приоритета данных
-        # Порядок важен: сначала базовые данные, потом специфичные (dimensions имеет приоритет)
         file_priority = ['oe', 'barcode', 'images', 'dimensions']
         key_files = {ftype: df for ftype, df in dataframes.items() if ftype in file_priority}
-        
+
         if key_files:
-            # Собираем все уникальные артикулы из всех файлов
             all_parts = pl.concat([
                 df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm']) 
-                for df in key_files.values() if 'artikul_norm' in df.columns and 'brand_norm' in df.columns
+                for ftype, df in key_files.items() if 'artikul_norm' in df.columns and 'brand_norm' in df.columns
             ]).filter(pl.col('artikul_norm') != "").unique(subset=['artikul_norm', 'brand_norm'], keep='first')
-
             parts_df = all_parts
 
-            # Обрабатываем файлы в определенном порядке для правильного приоритета данных
             for ftype in file_priority:
-                if ftype not in key_files: continue
+                if ftype not in key_files:
+                    continue
                 df = key_files[ftype]
-                if df.is_empty() or 'artikul_norm' not in df.columns: continue
-                
+                if df.is_empty() or 'artikul_norm' not in df.columns:
+                    continue
                 join_cols = [col for col in df.columns if col not in ['artikul', 'artikul_norm', 'brand', 'brand_norm']]
-                if not join_cols: continue
-                
-                # Фильтруем колонки, которые уже есть в parts_df, чтобы избежать дублирования
+                if not join_cols:
+                    continue
                 existing_cols = set(parts_df.columns)
                 join_cols = [col for col in join_cols if col not in existing_cols]
-                if not join_cols: continue
-                
-                df_subset = df.select(['artikul_norm', 'brand_norm'] + join_cols).unique(subset=['artikul_norm', 'brand_norm'], keep='first')
-                # coalesce=True перезаписывает пустые значения существующих колонок
-                # Суффиксы не создаются, так как мы уже отфильтровали существующие колонки
+                if not join_cols:
+                    continue
+                df_subset = df.select(['artikul_norm', 'brand_norm'] + join_cols).unique(subset=['artikul_norm', 'brand_norm'])
                 parts_df = parts_df.join(df_subset, on=['artikul_norm', 'brand_norm'], how='left', coalesce=True)
 
         if parts_df is not None and not parts_df.is_empty():
-            # Безопасная обработка multiplicity
             if 'multiplicity' not in parts_df.columns:
                 parts_df = parts_df.with_columns(multiplicity=pl.lit(1).cast(pl.Int32))
             else:
-                parts_df = parts_df.with_columns(
-                    pl.col('multiplicity').fill_null(1).cast(pl.Int32)
-                )
-            
-            # Обработка размеров и описание
+                parts_df = parts_df.with_columns(pl.col('multiplicity').fill_null(1).cast(pl.Int32))
+            # Обработка размеров
             for col in ['length', 'width', 'height']:
                 if col not in parts_df.columns:
                     parts_df = parts_df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
-            # Создать строки размеров
             parts_df = parts_df.with_columns([
                 pl.col('length').cast(pl.Utf8).fill_null('').alias('_length_str'),
                 pl.col('width').cast(pl.Utf8).fill_null('').alias('_width_str'),
                 pl.col('height').cast(pl.Utf8).fill_null('').alias('_height_str'),
             ])
-            # Создавать описание
             parts_df = parts_df.with_columns(
                 description=pl.concat_str(
                     [
@@ -340,7 +320,6 @@ class HighVolumeAutoPartsCatalog:
                     separator=''
                 )
             )
-            # Удаляем временные колонки
             parts_df = parts_df.drop(['_length_str', '_width_str', '_height_str'])
             final_columns = [
                 'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode', 
@@ -349,13 +328,13 @@ class HighVolumeAutoPartsCatalog:
             select_exprs = [pl.col(c) if c in parts_df.columns else pl.lit(None).alias(c) for c in final_columns]
             parts_df = parts_df.select(select_exprs)
             self.upsert_data('parts_data', parts_df, ['artikul_norm', 'brand_norm'])
-        
+
         if 'prices' in dataframes:
             step_counter += 1
             progress_bar.progress(step_counter / (num_steps + 1), text=f"({step_counter}/{num_steps}) Обработка ценовых данных...")
             df = dataframes['prices'].filter((pl.col('artikul_norm') != "") & (pl.col('brand_norm') != ""))
             self.upsert_data('prices', df, ['artikul_norm', 'brand_norm'])
-        
+
         progress_bar.progress(1.0, text="Обновление базы данных завершено!")
         time.sleep(1)
         progress_bar.empty()
@@ -712,6 +691,7 @@ class HighVolumeAutoPartsCatalog:
 
 
 def main():
+    # Настройка страницы
     st.set_page_config(page_title="AutoParts Catalog 10M+", layout="wide", page_icon="🚗")
     st.title("🚗 AutoParts Catalog - Профессиональная система для 10+ млн записей")
     st.markdown("""
@@ -723,9 +703,10 @@ def main():
     """)
     
     catalog = HighVolumeAutoPartsCatalog()
+
     st.sidebar.title("🧭 Навигация")
     menu_option = st.sidebar.radio("Выберите действие:", ["Загрузка данных", "Экспорт", "Статистика", "Управление данными"])
-    
+
     if menu_option == "Загрузка данных":
         st.header("📥 Загрузка и обработка данных")
         st.info("""
@@ -736,28 +717,69 @@ def main():
         ...
         """)
         col1, col2 = st.columns(2)
+
+        # Загрузка файлов с сохранением в session_state
         with col1:
+            if 'oe_file_path' not in st.session_state:
+                st.session_state['oe_file_path'] = None
+            if 'cross_file_path' not in st.session_state:
+                st.session_state['cross_file_path'] = None
+            if 'barcode_file_path' not in st.session_state:
+                st.session_state['barcode_file_path'] = None
+            if 'dimensions_file_path' not in st.session_state:
+                st.session_state['dimensions_file_path'] = None
+            if 'images_file_path' not in st.session_state:
+                st.session_state['images_file_path'] = None
+            if 'prices_file_path' not in st.session_state:
+                st.session_state['prices_file_path'] = None
+
             oe_file = st.file_uploader("1. Основные данные (OE)", type=['xlsx', 'xls'])
+            if oe_file:
+                path = catalog.data_dir / f"oe_{int(time.time())}_{oe_file.name}"
+                with open(path, "wb") as f:
+                    f.write(oe_file.getvalue())
+                st.session_state['oe_file_path'] = str(path)
             cross_file = st.file_uploader("2. Кроссы (OE -> Артикул)", type=['xlsx', 'xls'])
+            if cross_file:
+                path = catalog.data_dir / f"cross_{int(time.time())}_{cross_file.name}"
+                with open(path, "wb") as f:
+                    f.write(cross_file.getvalue())
+                st.session_state['cross_file_path'] = str(path)
             barcode_file = st.file_uploader("3. Штрих-коды и кратность", type=['xlsx', 'xls'])
+            if barcode_file:
+                path = catalog.data_dir / f"barcode_{int(time.time())}_{barcode_file.name}"
+                with open(path, "wb") as f:
+                    f.write(barcode_file.getvalue())
+                st.session_state['barcode_file_path'] = str(path)
+
         with col2:
             dimensions_file = st.file_uploader("4. Весогабаритные данные", type=['xlsx', 'xls'])
+            if dimensions_file:
+                path = catalog.data_dir / f"dimensions_{int(time.time())}_{dimensions_file.name}"
+                with open(path, "wb") as f:
+                    f.write(dimensions_file.getvalue())
+                st.session_state['dimensions_file_path'] = str(path)
             images_file = st.file_uploader("5. Ссылки на изображения", type=['xlsx', 'xls'])
+            if images_file:
+                path = catalog.data_dir / f"images_{int(time.time())}_{images_file.name}"
+                with open(path, "wb") as f:
+                    f.write(images_file.getvalue())
+                st.session_state['images_file_path'] = str(path)
             prices_file = st.file_uploader("6. Цены (рекомендованные)", type=['xlsx', 'xls'])
-        file_map = {
-            'oe': oe_file, 'cross': cross_file, 'barcode': barcode_file,
-            'dimensions': dimensions_file, 'images': images_file, 'prices': prices_file
-        }
+            if prices_file:
+                path = catalog.data_dir / f"prices_{int(time.time())}_{prices_file.name}"
+                with open(path, "wb") as f:
+                    f.write(prices_file.getvalue())
+                st.session_state['prices_file_path'] = str(path)
+
         if st.button("🚀 Начать обработку данных"):
             paths_to_process = {}
             any_file_uploaded = False
-            for ftype, uploaded_file in file_map.items():
-                if uploaded_file:
+            for key in ['oe', 'cross', 'barcode', 'dimensions', 'images', 'prices']:
+                path = st.session_state.get(f"{key}_file_path")
+                if path:
+                    paths_to_process[key] = path
                     any_file_uploaded = True
-                    path = catalog.data_dir / f"{ftype}_data_{int(time.time())}_{uploaded_file.name}"
-                    with open(path, "wb") as f:
-                        f.write(uploaded_file.getvalue())
-                    paths_to_process[ftype] = str(path)
             if any_file_uploaded:
                 stats = catalog.merge_all_data_parallel(paths_to_process)
                 if stats:
@@ -767,6 +789,7 @@ def main():
                     st.metric("Обработано файлов", f"{len(paths_to_process)}")
             else:
                 st.warning("⚠️ Пожалуйста, загрузите хотя бы один файл для начала обработки.")
+
     elif menu_option == "Экспорт":
         catalog.show_export_interface()
     elif menu_option == "Статистика":
